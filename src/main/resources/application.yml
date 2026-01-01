@@ -1,0 +1,15 @@
+server:
+  port: 8080
+
+app:
+  temp-dir: ${java.io.tmpdir}/mcp-docs
+  temp-ttl-minutes: 30
+
+mcp:
+  # stdio 실행 설정 : node + mcp 서버 엔트리 파일
+  command: node
+  args:
+#    - /absolute/path/to/mcp-server/index.js
+    - /Users/jhj89/workspace/kakaoMcp/nodeMcp/index.js
+  request-timeout-seconds: 60
+

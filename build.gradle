@@ -25,6 +25,13 @@ repositories {
 }
 
 dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+
+    // https://mvnrepository.com/artifact/org.springframework.ai/spring-ai-mcp
+    implementation 'org.springframework.ai:spring-ai-mcp:1.1.2'
+//    implementation "io.modelcontextprotocol.sdk:mcp"
+
     implementation 'org.springframework.boot:spring-boot-h2console'
     implementation 'org.springframework.boot:spring-boot-starter-data-jdbc'
     implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
