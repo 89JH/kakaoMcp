@@ -32,6 +32,11 @@ dependencies {
     implementation 'org.springframework.ai:spring-ai-mcp:1.1.2'
 //    implementation "io.modelcontextprotocol.sdk:mcp"
 
+    // EPUB/PDF/TXT 처리 의존성 추가 시작
+    implementation 'org.apache.tika:tika-core:2.9.2'
+    implementation 'org.apache.tika:tika-parsers-standard-package:2.9.2'
+    // EPUB/PDF/TXT 처리 의존성 추가 종료
+
     implementation 'org.springframework.boot:spring-boot-h2console'
     implementation 'org.springframework.boot:spring-boot-starter-data-jdbc'
     implementation 'org.springframework.boot:spring-boot-starter-data-jpa'

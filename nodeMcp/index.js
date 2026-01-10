@@ -1,101 +1,80 @@
-import fs from "node:fs";
-import path from "node:path";
+/**
+ * MCP stdio server (ESM)
+ * - package.json: "type":"module" 환경 대응
+ * - Spring이 stdio로 node를 띄우는 구조에서 사용
+ *
+ * tools:
+ * - summarize_document (Spring 내부 호출용, 필수)
+ * - summarize_text (alias, 선택)
+ */
 
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-    CallToolRequestSchema,
-    ListToolsRequestSchema
-} from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
 
-function readTextFile(filePath, maxChars = 20000) {
-    const ext = path.extname(filePath).toLowerCase();
-    if (![".txt", ".md"].includes(ext)) {
-        throw new Error(`MVP는 .txt/.md만 지원합니다. (${ext})`);
-    }
-    const raw = fs.readFileSync(filePath, "utf8");
-    return raw.slice(0, maxChars);
+const server = new McpServer({
+    name: "kakaoMcp-node",
+    version: "0.0.3",
+});
+
+// ✅ 요약 엔진(더미). 여기만 실제 LLM 호출로 바꾸면 됨.
+function summarizeToMarkdown({ text, mode = "abstract", maxChars = 6000 }) {
+    const src = (text || "").trim();
+    if (!src) return "# 오류\n입력 텍스트가 비어 있습니다.";
+
+    const clean = src.replace(/\s+/g, " ").trim();
+    const preview = clean.slice(0, Math.min(clean.length, 1200));
+
+    const md =
+        `# 요약\n` +
+        `## 모드\n- ${mode}\n\n` +
+        `## 핵심\n` +
+        `- ${preview.slice(0, 200)}${preview.length > 200 ? "..." : ""}\n` +
+        (preview.length > 260
+            ? `- ${preview.slice(200, 420)}${preview.length > 420 ? "..." : ""}\n`
+            : "") +
+        `\n## 참고\n- 입력 길이: ${clean.length} chars\n`;
+
+    return md.length > maxChars ? md.slice(0, maxChars) + "\n\n...(truncated)" : md;
 }
 
-function abstractSummary(text, maxChars = 4000) {
-    const lines = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-    const title = (lines[0] ?? "Untitled").slice(0, 120);
-    const bullets = lines.slice(1, 40).map(l => `- ${l.slice(0, 160)}`);
-
-    return [
-        "# 요약",
-        "## 제목(추정)",
-        title,
-        "",
-        "## 핵심 포인트(재서술 요약)",
-        ...bullets.slice(0, 10),
-    ].join("\n").slice(0, maxChars);
+async function runSummary({ text, mode, maxChars }) {
+    const md = summarizeToMarkdown({
+        text,
+        mode: mode ?? "abstract",
+        maxChars: maxChars ?? 6000,
+    });
+    return { content: [{ type: "text", text: md }] };
 }
 
-// ✅ 로우레벨 Server (가장 호환성 좋음)
-const server = new Server(
-    { name: "kakao-mcp", version: "0.0.1" },
-    { capabilities: { tools: {} } }
+/**
+ * ✅ 필수: Spring이 호출하는 이름
+ * summarize_document(text, mode?, maxChars?)
+ */
+server.tool(
+    "summarize_document",
+    "텍스트를 Markdown 형식으로 요약합니다. (Spring 내부 요약 엔진 호출용)",
+    {
+        text: z.string().describe("요약할 원문 텍스트"),
+        mode: z.string().optional().describe("요약 모드(예: abstract/final)"),
+        maxChars: z.number().int().optional().describe("요약 최대 글자 수"),
+    },
+    runSummary
 );
 
-// ✅ tools/list: 스키마를 명확히 내려줌
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return {
-        tools: [
-            {
-                name: "summarize_document",
-                description: "Summarize a local text/markdown file (safe abstract summary)",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        filePath: { type: "string", description: "서버가 읽을 로컬 파일 경로(.txt/.md)" },
-                        mode: { type: "string", description: "abstract(권장)", default: "abstract" },
-                        maxChars: { type: "number", description: "요약 최대 길이", default: 4000 }
-                    },
-                    required: ["filePath"]
-                }
-            }
-        ]
-    };
-});
+/**
+ * ✅ 선택: summarize_text alias (text만)
+ * - 추후 Spring이 이 이름으로 직접 호출하게 바꿀 수도 있음
+ */
+server.tool(
+    "summarize_text",
+    "긴 텍스트를 Markdown 형식으로 요약합니다.",
+    {
+        text: z.string().describe("요약할 원문 텍스트"),
+    },
+    async ({ text }) => runSummary({ text, mode: "abstract", maxChars: 6000 })
+);
 
-// ✅ tools/call: args는 request.params.input (또는 arguments)로 들어옴
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    try {
-        if (request.params.name !== "summarize_document") {
-            return {
-                isError: true,
-                content: [{ type: "text", text: `Unknown tool: ${request.params.name}` }]
-            };
-        }
-
-        const args = request.params.input ?? request.params.arguments ?? {}; // 스펙/구현 차이 방어 :contentReference[oaicite:2]{index=2}
-        const filePath = args.filePath;
-        const mode = args.mode ?? "abstract";
-        const maxChars = args.maxChars ?? 4000;
-
-        if (!filePath || typeof filePath !== "string") {
-            return {
-                isError: true,
-                content: [{ type: "text", text: `filePath missing. got args=${JSON.stringify(args)}` }]
-            };
-        }
-
-        const text = readTextFile(filePath, 20000);
-        const summary = abstractSummary(text, maxChars);
-
-        return {
-            content: [{ type: "text", text: summary }]
-        };
-    } catch (e) {
-        console.error("Tool error:", e); // stderr only
-        return {
-            isError: true,
-            content: [{ type: "text", text: e?.message ? String(e.message) : "Unknown error" }]
-        };
-    }
-});
-
-// ✅ stdio 연결
-await server.connect(new StdioServerTransport());
-console.error("[kakao-mcp] server started (stderr)");
+// stdio 실행
+const transport = new StdioServerTransport();
+await server.connect(transport);

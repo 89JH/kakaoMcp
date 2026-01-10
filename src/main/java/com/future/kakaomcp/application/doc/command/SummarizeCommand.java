@@ -1,9 +1,13 @@
 package com.future.kakaomcp.application.doc.command;
 
-import jakarta.validation.constraints.NotBlank;
-import lombok.Builder;
-
-@Builder
+/**
+ * summarize 요청 파라미터를 담는 커맨드.
+ */
 public record SummarizeCommand(
-        @NotBlank String mode
-) {}
+        String mode,
+        Boolean includeMeta
+) {
+    public boolean includeMetaOrDefaultTrue() {
+        return includeMeta == null || includeMeta;
+    }
+}

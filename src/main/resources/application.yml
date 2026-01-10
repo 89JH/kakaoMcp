@@ -1,15 +1,39 @@
 server:
   port: 8080
 
+spring:
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 50MB
+
 app:
   temp-dir: ${java.io.tmpdir}/mcp-docs
   temp-ttl-minutes: 30
+  summarize:
+    chunk:
+      # 긴 문서 요약 품질 개선용 Chunking 파라미터 (필요 시 조정)
+      target-chars: 3000
+      overlap-chars: 250
+      min-chars: 900
+
+    enrich:
+      enabled: true
+      crossref:
+        base-url: "https://api.crossref.org"
+        mailto: "chhh333@naver.com"
+        timeout-ms: 4000
+      google-books:
+        base-url: "https://www.googleapis.com/books/v1"
+        api-key: ""
+        timeout-ms: 4000
 
 mcp:
   # stdio 실행 설정 : node + mcp 서버 엔트리 파일
   command: node
   args:
 #    - /absolute/path/to/mcp-server/index.js
-    - /Users/jhj89/workspace/kakaoMcp/nodeMcp/index.js
+#    - /Users/jhj89/workspace/kakaoMcp/nodeMcp/index.js
+    - /opt/kakaoMcp/nodeMcp/index.js
   request-timeout-seconds: 60
 
