@@ -26,7 +26,10 @@ repositories {
 
 dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-webflux'
     implementation 'org.springframework.boot:spring-boot-starter-validation'
+
+    implementation 'org.jsoup:jsoup:1.17.2'
 
     // https://mvnrepository.com/artifact/org.springframework.ai/spring-ai-mcp
     implementation 'org.springframework.ai:spring-ai-mcp:1.1.2'

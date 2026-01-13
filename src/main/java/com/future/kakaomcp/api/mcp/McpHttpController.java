@@ -3,26 +3,29 @@ package com.future.kakaomcp.api.mcp;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.future.kakaomcp.api.doc.dto.SummarizeResponse;
 import com.future.kakaomcp.application.doc.DocFacade;
+import com.future.kakaomcp.application.doc.SummaryOutputCleaner;
 import com.future.kakaomcp.application.doc.command.SummarizeCommand;
 import lombok.RequiredArgsConstructor;
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.jsoup.select.Elements;
 import org.springframework.http.MediaType;
+import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
+import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.nio.file.*;
-import java.nio.file.attribute.FileTime;
-import java.time.Duration;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.*;
-import java.util.Base64;
+import java.util.regex.Pattern;
 
 import static com.future.kakaomcp.api.mcp.JsonRpcDto.*;
 
@@ -31,10 +34,10 @@ import static com.future.kakaomcp.api.mcp.JsonRpcDto.*;
  * - tools/list
  * - tools/call: summarize_text / summarize_url / summarize_file (+ legacy summarize_document)
  *
- * NOTE:
- * - URL/File은 서버에 저장(/opt/kakaoMcp/uploads) 후 처리, TTL 1일
- * - PlayMCP 인식 안정화를 위해 요약 출력 Markdown 포맷을 "고정"한다.
- * - 기존 요약 엔진이 포함할 수 있는 "abstract/final/입력 길이/모드" 등 메타 라인을 strip 후 포맷팅한다.
+ * 목표:
+ *  - tool 응답은 "요약 결과만" (CallToolResult[...] / 프롬프트 누출 방지)
+ *  - summarize_url: HTML이면 jsoup 본문 추출 -> summarize_text 경로, PDF/EPUB는 file pipeline 유지
+ *  - 제한값은 application.yml로 설정
  */
 @RestController
 @RequestMapping("/api/mcp")
@@ -46,18 +49,15 @@ public class McpHttpController {
     private static final String TOOL_SUMMARIZE_TEXT = "summarize_text";
     private static final String TOOL_SUMMARIZE_URL  = "summarize_url";
     private static final String TOOL_SUMMARIZE_FILE = "summarize_file";
-    private static final String TOOL_LEGACY_SUMMARIZE_DOCUMENT = "summarize_document"; // 호환
+    private static final String TOOL_LEGACY_SUMMARIZE_DOCUMENT = "summarize_document";
 
-    private static final long MAX_DOWNLOAD_BYTES = 25L * 1024L * 1024L; // 25MB
-    private static final long MAX_FILE_BYTES     = 25L * 1024L * 1024L; // 25MB
-    private static final int CONNECT_TIMEOUT_MS  = 10_000;
-    private static final int READ_TIMEOUT_MS     = 60_000;
-    private static final int MAX_REDIRECTS       = 8;
-
-    private static final Path UPLOAD_DIR = Paths.get("/opt/kakaoMcp/uploads");
-    private static final Duration TTL = Duration.ofDays(1);
+    // upload cleanup (기존 동작 유지)
+    private static final String UPLOAD_DIR_NAME = "uploads";
+    private static final String UPLOAD_PREFIX = "mcp_";
+    private static final Pattern SAFE_NAME = Pattern.compile("[^a-zA-Z0-9._-]+");
 
     private final DocFacade docFacade;
+    private final McpToolProperties props;
 
     @PostMapping(
             consumes = MediaType.APPLICATION_JSON_VALUE,
@@ -69,18 +69,18 @@ public class McpHttpController {
     ) throws Exception {
 
         boolean wantsSse = accept != null && accept.contains(MediaType.TEXT_EVENT_STREAM_VALUE);
-
         Response rpc = dispatch(req);
 
         if (!wantsSse) return rpc;
 
-        // 최소 SSE(단발성)
-        SseEmitter emitter = new SseEmitter(30_000L);
+        // PlayMCP가 SSE accept 할 때를 위해 “단발 SSE”로 응답
+        SseEmitter emitter = new SseEmitter(props.getSse().getTimeoutMs());
         String json = OM.writeValueAsString(rpc);
         emitter.send(SseEmitter.event()
                 .id(String.valueOf(Instant.now().toEpochMilli()))
                 .name("message")
-                .data(json, MediaType.APPLICATION_JSON));
+                .data(json)
+        );
         emitter.complete();
         return emitter;
     }
@@ -102,10 +102,13 @@ public class McpHttpController {
     }
 
     private Map<String, Object> initializeResult() {
+        // 최소 initialize 응답
         return Map.of(
-                "protocolVersion", "2025-11-25",
-                "serverInfo", Map.of("name", "kakaoMcp-spring", "version", "0.0.8"),
-                "capabilities", Map.of("tools", Map.of())
+                "protocolVersion", "2024-11-05",
+                "serverInfo", Map.of("name", "kakao-mcp-http", "version", "1.0.0"),
+                "capabilities", Map.of(
+                        "tools", Map.of("listChanged", false)
+                )
         );
     }
 
@@ -114,11 +117,13 @@ public class McpHttpController {
 
         tools.add(Map.of(
                 "name", TOOL_SUMMARIZE_TEXT,
-                "description", "텍스트를 Markdown 요약(고정 포맷)합니다.",
+                "description", "텍스트를 요약합니다. (결과만 반환)",
                 "inputSchema", Map.of(
                         "type", "object",
                         "properties", Map.of(
-                                "text", Map.of("type", "string", "description", "요약할 텍스트")
+                                "text", Map.of("type", "string", "description", "요약할 텍스트"),
+                                "mode", Map.of("type", "string", "description", "abstract|final", "default", "abstract"),
+                                "includeMeta", Map.of("type", "boolean", "default", false)
                         ),
                         "required", List.of("text")
                 )
@@ -126,11 +131,13 @@ public class McpHttpController {
 
         tools.add(Map.of(
                 "name", TOOL_SUMMARIZE_URL,
-                "description", "URL 문서를 다운로드 후 서버에 임시 저장하고 요약합니다. (TTL 1일)",
+                "description", "URL을 요약합니다. HTML은 본문 추출 후 요약하며, PDF/EPUB 등은 파일 파이프라인을 사용합니다. (결과만 반환)",
                 "inputSchema", Map.of(
                         "type", "object",
                         "properties", Map.of(
-                                "url", Map.of("type", "string", "description", "요약할 문서 URL (http/https)")
+                                "url", Map.of("type", "string", "description", "요약할 URL"),
+                                "mode", Map.of("type", "string", "description", "abstract|final", "default", "abstract"),
+                                "includeMeta", Map.of("type", "boolean", "default", false)
                         ),
                         "required", List.of("url")
                 )
@@ -138,14 +145,31 @@ public class McpHttpController {
 
         tools.add(Map.of(
                 "name", TOOL_SUMMARIZE_FILE,
-                "description", "base64 파일 업로드 → 서버 저장 → 요약합니다. (TTL 1일)",
+                "description", "Base64로 전달된 파일(PDF/EPUB/TXT 등)을 요약합니다. (결과만 반환)",
                 "inputSchema", Map.of(
                         "type", "object",
                         "properties", Map.of(
-                                "filename", Map.of("type", "string", "description", "원본 파일명"),
-                                "contentBase64", Map.of("type", "string", "description", "base64 인코딩된 파일 내용")
+                                "filename", Map.of("type", "string", "default", "upload.bin"),
+                                "contentBase64", Map.of("type", "string", "description", "파일 base64 (data:...;base64, 가능)"),
+                                "mode", Map.of("type", "string", "description", "abstract|final", "default", "abstract"),
+                                "includeMeta", Map.of("type", "boolean", "default", false)
                         ),
-                        "required", List.of("filename", "contentBase64")
+                        "required", List.of("contentBase64")
+                )
+        ));
+
+        // legacy alias
+        tools.add(Map.of(
+                "name", TOOL_LEGACY_SUMMARIZE_DOCUMENT,
+                "description", "summarize_text와 동일(호환용)",
+                "inputSchema", Map.of(
+                        "type", "object",
+                        "properties", Map.of(
+                                "text", Map.of("type", "string"),
+                                "mode", Map.of("type", "string", "default", "abstract"),
+                                "includeMeta", Map.of("type", "boolean", "default", false)
+                        ),
+                        "required", List.of("text")
                 )
         ));
 
@@ -156,6 +180,8 @@ public class McpHttpController {
     private Map<String, Object> toolsCallResult(Map<String, Object> params) throws Exception {
         ensureUploadDir();
         cleanupExpiredUploads();
+
+        if (params == null) return toolError("params 가 비어 있습니다.");
 
         String name = String.valueOf(params.get("name"));
         Map<String, Object> args = (Map<String, Object>) params.getOrDefault("arguments", Map.of());
@@ -169,43 +195,73 @@ public class McpHttpController {
         if (TOOL_SUMMARIZE_FILE.equals(name)) {
             return callSummarizeFile(args);
         }
-        return toolError("Unknown tool: " + name);
+        return toolError("지원하지 않는 tool 입니다: " + name);
     }
 
     private Map<String, Object> callSummarizeText(Map<String, Object> args) {
-        String text = String.valueOf(args.getOrDefault("text", ""));
-        SummarizeResponse resp = docFacade.summarizeText(text, new SummarizeCommand("abstract", false));
+        String text = String.valueOf(args.getOrDefault("text", "")).trim();
+        if (text.isBlank()) return toolError("text 파라미터가 비어 있습니다.");
 
-        String md = formatSummary(
-                resp.getSummaryText(),
-                "text",
-                Map.of()
-        );
-        return toolOk(md);
+        String mode = String.valueOf(args.getOrDefault("mode", "abstract"));
+        boolean includeMeta = readBool(args.get("includeMeta"), false);
+
+        SummarizeResponse resp = docFacade.summarizeText(text, new SummarizeCommand(mode, includeMeta));
+
+        // ✅ tool은 “요약 결과만”
+        String clean = SummaryOutputCleaner.clean(resp.getSummaryText());
+        return toolOk(clean);
     }
 
     private Map<String, Object> callSummarizeUrl(Map<String, Object> args) throws Exception {
         String url = String.valueOf(args.getOrDefault("url", "")).trim();
         if (url.isBlank()) return toolError("url 파라미터가 비어 있습니다.");
 
+        String mode = String.valueOf(args.getOrDefault("mode", "abstract"));
+        boolean includeMeta = readBool(args.get("includeMeta"), false);
+
         URLDownload d = download(url);
         if (d.bytes == null || d.bytes.length == 0) {
             return toolError("URL 다운로드 결과가 비어 있습니다.");
         }
 
+        String ct = (d.contentType == null) ? "application/octet-stream" : d.contentType.toLowerCase(Locale.ROOT);
+        // content-type이 애매한 경우 확장자로 보정
+        if (!StringUtils.hasText(ct) || "application/octet-stream".equals(ct)) {
+            ct = guessContentTypeByName(d.fileName);
+        }
+
+        // ✅ HTML: jsoup 본문 텍스트 추출 → summarizeText로 전달
+        if (ct.startsWith("text/html") || looksLikeHtml(d.bytes)) {
+            Charset cs = guessCharset(ct);
+            String html = new String(d.bytes, cs);
+            ExtractHtmlResult extracted = extractMainTextFromHtml(
+                    url,
+                    html,
+                    props.getUrl().getMaxParas(),
+                    props.getUrl().getMaxUrlChars()
+            );
+            String bodyText = extracted.text == null ? "" : extracted.text;
+
+            if (bodyText.isBlank()) {
+                return toolError("HTML 본문 추출 결과가 비어 있습니다. (maxUrlChars/maxParas 조정 필요)");
+            }
+
+            SummarizeResponse resp = docFacade.summarizeText(bodyText, new SummarizeCommand(mode, includeMeta));
+            String clean = SummaryOutputCleaner.clean(resp.getSummaryText());
+            return toolOk(clean);
+        }
+
+        // ✅ PDF/EPUB 등: 기존 file pipeline 유지
+        if (d.bytes.length > props.getDownload().getMaxBytes()) {
+            return toolError("다운로드 파일이 너무 큽니다. 최대 " + (props.getDownload().getMaxBytes() / (1024 * 1024)) + "MB");
+        }
+
         SavedFile saved = saveToUploads(d.fileName, d.bytes);
-
         MultipartFile mf = new InMemoryMultipartFile(d.fileName, d.contentType, d.bytes);
-        SummarizeResponse resp = docFacade.summarizeFile(mf, new SummarizeCommand("abstract", false));
 
-        Map<String, Object> refs = new LinkedHashMap<>();
-        refs.put("fileId", saved.fileId());
-        refs.put("storedFileName", saved.storedFileName());
-        refs.put("expiresAtUtc", saved.expiresAtUtc());
-        refs.put("sourceUrl", url);
-
-        String md = formatSummary(resp.getSummaryText(), "url", refs);
-        return toolOk(md);
+        SummarizeResponse resp = docFacade.summarizeFile(mf, new SummarizeCommand(mode, includeMeta));
+        String clean = SummaryOutputCleaner.clean(resp.getSummaryText());
+        return toolOk(clean);
     }
 
     private Map<String, Object> callSummarizeFile(Map<String, Object> args) throws Exception {
@@ -213,7 +269,9 @@ public class McpHttpController {
         String raw = String.valueOf(args.getOrDefault("contentBase64", "")).trim();
         if (raw.isBlank()) return toolError("contentBase64 파라미터가 비어 있습니다.");
 
-        // data:...;base64,xxxx 형태 제거
+        String mode = String.valueOf(args.getOrDefault("mode", "abstract"));
+        boolean includeMeta = readBool(args.get("includeMeta"), false);
+
         if (raw.startsWith("data:")) {
             int comma = raw.indexOf(',');
             if (comma >= 0) raw = raw.substring(comma + 1);
@@ -226,359 +284,286 @@ public class McpHttpController {
             return toolError("contentBase64 디코딩 실패: base64 문자열을 확인해주세요.");
         }
 
-        if (bytes.length > MAX_FILE_BYTES) {
-            return toolError("파일이 너무 큽니다. 최대 " + (MAX_FILE_BYTES / (1024 * 1024)) + "MB 까지 가능합니다.");
+        if (bytes.length > props.getFile().getMaxBytes()) {
+            return toolError("파일이 너무 큽니다. 최대 " + (props.getFile().getMaxBytes() / (1024 * 1024)) + "MB");
         }
 
         SavedFile saved = saveToUploads(filename, bytes);
+        MultipartFile mf = new InMemoryMultipartFile(filename, guessContentTypeByName(filename), bytes);
 
-        MultipartFile mf = new InMemoryMultipartFile(filename, guessContentType(filename), bytes);
-        SummarizeResponse resp = docFacade.summarizeFile(mf, new SummarizeCommand("abstract", false));
-
-        Map<String, Object> refs = new LinkedHashMap<>();
-        refs.put("fileId", saved.fileId());
-        refs.put("storedFileName", saved.storedFileName());
-        refs.put("expiresAtUtc", saved.expiresAtUtc());
-
-        String md = formatSummary(resp.getSummaryText(), "file", refs);
-        return toolOk(md);
+        SummarizeResponse resp = docFacade.summarizeFile(mf, new SummarizeCommand(mode, includeMeta));
+        String clean = SummaryOutputCleaner.clean(resp.getSummaryText());
+        return toolOk(clean);
     }
 
     // -------------------------
-    // PlayMCP 인식용 "고정 포맷"
+    // MCP tool response shape
     // -------------------------
-
-    private String formatSummary(String raw, String inputType, Map<String, Object> refs) {
-        // ✅ 기존 요약 엔진이 포함하는 메타 라인을 제거한 뒤 포맷팅
-        String body = stripMetaLines((raw == null) ? "" : raw.trim());
-
-        String oneLine = extractOneLine(body);
-        List<String> bullets = extractBullets(body);
-
-        StringBuilder sb = new StringBuilder();
-        sb.append("# 문서 요약\n\n");
-
-        sb.append("## 한 줄 요약\n");
-        if (!oneLine.isBlank()) sb.append("- ").append(oneLine).append("\n");
-        else sb.append("- (요약 생성 결과가 비어 있습니다)\n");
-        sb.append("\n");
-
-        sb.append("## 핵심 포인트\n");
-        if (!bullets.isEmpty()) {
-            for (int i = 0; i < Math.min(7, bullets.size()); i++) {
-                sb.append("- ").append(bullets.get(i)).append("\n");
-            }
-        } else if (!body.isBlank()) {
-            sb.append("- ").append(truncate(cleanInline(stripHeadings(body)), 220)).append("\n");
-        } else {
-            sb.append("- (핵심 포인트를 추출할 수 없습니다)\n");
-        }
-        sb.append("\n");
-
-        sb.append("## 참고\n");
-        sb.append("- 입력: ").append(inputType).append("\n");
-        sb.append("- 길이: ").append((raw == null) ? 0 : raw.length()).append(" chars\n");
-
-        if (refs != null) {
-            if (refs.get("sourceUrl") != null) sb.append("- URL: ").append(refs.get("sourceUrl")).append("\n");
-            if (refs.get("fileId") != null) sb.append("- fileId: ").append(refs.get("fileId")).append("\n");
-            if (refs.get("expiresAtUtc") != null) sb.append("- 만료(UTC): ").append(refs.get("expiresAtUtc")).append("\n");
-            if (refs.get("storedFileName") != null) sb.append("- 저장 파일명: ").append(refs.get("storedFileName")).append("\n");
-        }
-
-        return sb.toString().trim() + "\n";
-    }
-
-    /**
-     * 기존 요약 엔진이 생성하는 내부 메타(모드/입력길이/abstract 접두 등)를 제거한다.
-     * - "## 모드", "- abstract", "- final"
-     * - "- abstract - ..." 접두
-     * - "- 입력 길이: 37 chars" 등
-     */
-    private String stripMetaLines(String s) {
-        if (s == null) return "";
-        String out = s;
-
-        // "입력 길이: ..." 라인 제거
-        out = out.replaceAll("(?m)^-\\s*입력\\s*길이\\s*:\\s*.*$", "");
-        out = out.replaceAll("(?m)^입력\\s*길이\\s*:\\s*.*$", "");
-
-        // "## 모드" 헤더 제거
-        out = out.replaceAll("(?m)^##\\s*모드\\s*$", "");
-
-        // 단독 모드 라인 제거
-        out = out.replaceAll("(?m)^-\\s*(abstract|final)\\s*$", "");
-
-        // "- abstract - ..." / "- final - ..." 접두 제거
-        out = out.replaceAll("(?m)^-\\s*(abstract|final)\\s*-\\s*", "- ");
-
-        // 잔여 공백 정리
-        out = out.replaceAll("[ \\t]+", " ");
-        out = out.replaceAll("(?m)^\\s+$", "");
-        return out.trim();
-    }
-
-    private String extractOneLine(String md) {
-        if (md == null) return "";
-        String cleaned = stripHeadings(md).trim();
-        cleaned = cleanInline(cleaned);
-
-        if (cleaned.isBlank()) return "";
-
-        String[] parts = cleaned.split("[\\r\\n]+");
-        String first = parts[0].trim();
-        if (first.startsWith("-")) first = first.replaceFirst("^[-*•]\\s*", "").trim();
-        return truncate(first, 180);
-    }
-
-    private List<String> extractBullets(String md) {
-        if (md == null) return List.of();
-        List<String> out = new ArrayList<>();
-        String[] lines = md.split("\\R");
-        for (String line : lines) {
-            String s = (line == null) ? "" : line.trim();
-            if (s.isEmpty()) continue;
-            if (s.startsWith("#")) continue;
-
-            if (s.matches("^[-*•]\\s+.+")) {
-                out.add(cleanInline(s.replaceFirst("^[-*•]\\s+", "")));
-            } else if (s.matches("^\\d+\\.\\s+.+")) {
-                out.add(cleanInline(s.replaceFirst("^\\d+\\.\\s+", "")));
-            }
-        }
-
-        // 메타성 bullet 제거
-        out.removeIf(x -> x == null || x.trim().length() < 8);
-        out.removeIf(x -> {
-            String t = x.trim().toLowerCase(Locale.ROOT);
-            return t.startsWith("입력 길이")
-                    || t.startsWith("모드")
-                    || t.equals("abstract")
-                    || t.equals("final");
-        });
-
-        return out;
-    }
-
-    private String stripHeadings(String s) {
-        if (s == null) return "";
-        // "# ..." 형태의 heading 라인을 제거
-        return s.replaceAll("(?m)^#{1,6}\\s+.*$", "").trim();
-    }
-
-    private String cleanInline(String s) {
-        if (s == null) return "";
-        return s.replaceAll("\\s+", " ").trim();
-    }
-
-    private String truncate(String s, int max) {
-        if (s == null) return "";
-        if (s.length() <= max) return s;
-        return s.substring(0, max) + "...";
-    }
-
-    // -------------------------
-    // Tool response wrappers
-    // -------------------------
-
     private Map<String, Object> toolOk(String text) {
+        // MCP spec 형태: { content: [ { type:"text", text:"..." } ] }
         return Map.of(
-                "content", List.of(Map.of("type", "text", "text", text)),
-                "isError", false
+                "content", List.of(
+                        Map.of("type", "text", "text", (text == null ? "" : text))
+                )
         );
     }
 
-    private Map<String, Object> toolError(String text) {
+    private Map<String, Object> toolError(String message) {
         return Map.of(
-                "content", List.of(Map.of("type", "text", "text", text)),
-                "isError", true
+                "isError", true,
+                "content", List.of(Map.of("type", "text", "text", "ERROR: " + message))
         );
     }
 
-    // -------------------------
-    // Upload store (TTL 1 day)
-    // -------------------------
-
-    private void ensureUploadDir() throws Exception {
-        if (!Files.exists(UPLOAD_DIR)) Files.createDirectories(UPLOAD_DIR);
-    }
-
-    private void cleanupExpiredUploads() throws Exception {
-        Instant cutoff = Instant.now().minus(TTL);
-        try (DirectoryStream<Path> ds = Files.newDirectoryStream(UPLOAD_DIR)) {
-            for (Path p : ds) {
-                try {
-                    FileTime ft = Files.getLastModifiedTime(p);
-                    if (ft.toInstant().isBefore(cutoff)) {
-                        Files.deleteIfExists(p);
-                    }
-                } catch (Exception ignore) {
-                    // TTL 정리는 best-effort
-                }
-            }
-        }
-    }
-
-    private SavedFile saveToUploads(String name, byte[] bytes) throws Exception {
-        String id = UUID.randomUUID().toString();
-        String stored = id + "__" + sanitize(name);
-        Path p = UPLOAD_DIR.resolve(stored);
-
-        Files.write(p, bytes, StandardOpenOption.CREATE_NEW);
-        OffsetDateTime exp = OffsetDateTime.ofInstant(Instant.now().plus(TTL), ZoneOffset.UTC);
-        return new SavedFile(id, stored, exp.toString());
-    }
-
-    private String sanitize(String s) {
-        if (s == null || s.isBlank()) return "upload.bin";
-        return s.replaceAll("[^a-zA-Z0-9가-힣._-]", "_");
-    }
-
-    private String guessContentType(String f) {
-        if (f == null) return MediaType.APPLICATION_OCTET_STREAM_VALUE;
-        String l = f.toLowerCase(Locale.ROOT);
-        if (l.endsWith(".pdf")) return "application/pdf";
-        if (l.endsWith(".epub")) return "application/epub+zip";
-        if (l.endsWith(".txt")) return "text/plain";
-        return MediaType.APPLICATION_OCTET_STREAM_VALUE;
+    private boolean readBool(Object v, boolean def) {
+        if (v == null) return def;
+        if (v instanceof Boolean b) return b;
+        String s = String.valueOf(v).trim().toLowerCase(Locale.ROOT);
+        if (s.isBlank()) return def;
+        return "true".equals(s) || "1".equals(s) || "y".equals(s) || "yes".equals(s);
     }
 
     // -------------------------
-    // URL download (redirect-safe)
+    // URL download
     // -------------------------
+    private record URLDownload(String fileName, String contentType, byte[] bytes) {}
 
-    private URLDownload download(String rawUrl) throws Exception {
-        String current = rawUrl;
+    private URLDownload download(String url) throws Exception {
+        String cur = url;
+        int redirects = 0;
 
-        for (int i = 0; i < MAX_REDIRECTS; i++) {
-            HttpURLConnection c = (HttpURLConnection) new URL(current).openConnection();
-            c.setInstanceFollowRedirects(false);
-            c.setConnectTimeout(CONNECT_TIMEOUT_MS);
-            c.setReadTimeout(READ_TIMEOUT_MS);
-            c.setRequestProperty("User-Agent", "kakaoMcp/0.0.8");
-            c.setRequestProperty("Accept", "*/*");
+        while (true) {
+            HttpURLConnection conn = (HttpURLConnection) new URL(cur).openConnection();
+            conn.setInstanceFollowRedirects(false);
+            conn.setConnectTimeout(props.getDownload().getConnectTimeoutMs());
+            conn.setReadTimeout(props.getDownload().getReadTimeoutMs());
+            conn.setRequestProperty("User-Agent", props.getDownload().getUserAgent());
 
-            int status = c.getResponseCode();
-
-            if (status >= 300 && status < 400) {
-                String loc = c.getHeaderField("Location");
-                if (loc == null || loc.isBlank()) {
-                    throw new IllegalStateException("리다이렉트 응답이지만 Location 헤더가 없습니다. status=" + status);
-                }
-                URL base = new URL(current);
-                current = new URL(base, loc).toString();
+            int code = conn.getResponseCode();
+            if (code >= 300 && code < 400) {
+                String loc = conn.getHeaderField("Location");
+                if (loc == null || loc.isBlank()) break;
+                redirects++;
+                if (redirects > props.getDownload().getMaxRedirects()) throw new RuntimeException("Too many redirects");
+                cur = resolveRedirect(cur, loc);
                 continue;
             }
 
-            if (status < 200 || status >= 300) {
-                throw new IllegalStateException("URL 다운로드 실패. status=" + status + ", url=" + current);
-            }
+            String contentType = Optional.ofNullable(conn.getContentType()).orElse("application/octet-stream");
+            String fileName = guessFileName(cur, conn);
 
-            String ct = c.getContentType();
-            long len = c.getContentLengthLong();
-            if (len > MAX_DOWNLOAD_BYTES) {
-                throw new IllegalStateException("URL 파일이 너무 큽니다. 최대 " + (MAX_DOWNLOAD_BYTES / (1024 * 1024)) + "MB 까지 가능합니다.");
-            }
-
-            try (InputStream in = c.getInputStream()) {
-                byte[] b = readWithLimit(in, MAX_DOWNLOAD_BYTES);
-                String name = guessNameFromUrlOrHeader(current, c);
-                return new URLDownload(name, (ct == null ? MediaType.APPLICATION_OCTET_STREAM_VALUE : ct), b);
+            try (InputStream is = conn.getInputStream()) {
+                byte[] bytes = readUpTo(is, props.getDownload().getMaxBytes());
+                return new URLDownload(fileName, contentType, bytes);
             }
         }
 
-        throw new IllegalStateException("리다이렉트 횟수 초과: " + rawUrl);
+        throw new RuntimeException("URL 다운로드 실패");
     }
 
-    private byte[] readWithLimit(InputStream in, long limit) throws Exception {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
+    private String resolveRedirect(String base, String location) throws Exception {
+        URL baseUrl = new URL(base);
+        URL resolved = new URL(baseUrl, location);
+        return resolved.toString();
+    }
+
+    private byte[] readUpTo(InputStream is, long maxBytes) throws IOException {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
         byte[] buf = new byte[8192];
         long total = 0;
         int n;
-        while ((n = in.read(buf)) >= 0) {
+        while ((n = is.read(buf)) >= 0) {
             total += n;
-            if (total > limit) {
-                throw new IllegalStateException("다운로드 용량 초과(>" + (limit / (1024 * 1024)) + "MB)");
-            }
-            out.write(buf, 0, n);
+            if (total > maxBytes) throw new IOException("download too large");
+            bos.write(buf, 0, n);
         }
-        return out.toByteArray();
+        return bos.toByteArray();
     }
 
-    private String guessNameFromUrlOrHeader(String url, HttpURLConnection c) {
-        String cd = c.getHeaderField("Content-Disposition");
+    private String guessFileName(String url, HttpURLConnection conn) {
+        // Content-Disposition 우선
+        String cd = conn.getHeaderField("Content-Disposition");
         if (cd != null) {
-            String fn = extractFilenameFromContentDisposition(cd);
-            if (fn != null && !fn.isBlank()) return sanitize(fn);
+            String lower = cd.toLowerCase(Locale.ROOT);
+            int idx = lower.indexOf("filename=");
+            if (idx >= 0) {
+                String v = cd.substring(idx + "filename=".length()).trim();
+                v = v.replace("\"", "");
+                if (StringUtils.hasText(v)) return sanitizeName(v);
+            }
         }
-        return guessName(url);
+        // URL path fallback
+        try {
+            String path = new URL(url).getPath();
+            if (StringUtils.hasText(path)) {
+                int slash = path.lastIndexOf('/');
+                String name = (slash >= 0) ? path.substring(slash + 1) : path;
+                if (StringUtils.hasText(name)) return sanitizeName(name);
+            }
+        } catch (Exception ignored) {}
+        return "download.bin";
     }
 
-    private String extractFilenameFromContentDisposition(String cd) {
+    private String sanitizeName(String name) {
+        String s = SAFE_NAME.matcher(name).replaceAll("_");
+        if (s.length() > 120) s = s.substring(s.length() - 120);
+        if (!StringUtils.hasText(s)) return "file.bin";
+        return s;
+    }
+
+    private String guessContentTypeByName(String filename) {
+        String lower = (filename == null ? "" : filename.toLowerCase(Locale.ROOT));
+        if (lower.endsWith(".pdf")) return "application/pdf";
+        if (lower.endsWith(".epub")) return "application/epub+zip";
+        if (lower.endsWith(".html") || lower.endsWith(".htm")) return "text/html";
+        if (lower.endsWith(".txt") || lower.endsWith(".md")) return "text/plain";
+        return "application/octet-stream";
+    }
+
+    private boolean looksLikeHtml(byte[] bytes) {
+        if (bytes == null || bytes.length < 20) return false;
+        String head = new String(bytes, 0, Math.min(bytes.length, 300), StandardCharsets.UTF_8).toLowerCase(Locale.ROOT);
+        return head.contains("<html") || head.contains("<!doctype html") || head.contains("<head") || head.contains("<body");
+    }
+
+    private Charset guessCharset(String contentTypeLower) {
         try {
-            String lower = cd.toLowerCase(Locale.ROOT);
-            int idx = lower.indexOf("filename*=");
-            if (idx >= 0) {
-                String part = cd.substring(idx + "filename*=".length()).trim();
-                int q = part.indexOf("''");
-                if (q >= 0) {
-                    String v = part.substring(q + 2).trim();
-                    v = v.replaceAll("^\"|\"$", "");
-                    return v;
+            if (contentTypeLower == null) return StandardCharsets.UTF_8;
+            // e.g. text/html; charset=utf-8
+            String[] parts = contentTypeLower.split(";");
+            for (String p : parts) {
+                String t = p.trim();
+                if (t.startsWith("charset=")) {
+                    String cs = t.substring("charset=".length()).trim();
+                    if (StringUtils.hasText(cs)) return Charset.forName(cs);
                 }
             }
-            idx = lower.indexOf("filename=");
-            if (idx >= 0) {
-                String part = cd.substring(idx + "filename=".length()).trim();
-                int semi = part.indexOf(';');
-                if (semi >= 0) part = part.substring(0, semi);
-                part = part.trim().replaceAll("^\"|\"$", "");
-                return part;
+        } catch (Exception ignored) {}
+        return StandardCharsets.UTF_8;
+    }
+
+    // -------------------------
+    // HTML main text extraction
+    // -------------------------
+    private record ExtractHtmlResult(String title, String text) {}
+
+    private ExtractHtmlResult extractMainTextFromHtml(String url, String html, int maxParas, int maxChars) {
+        Document doc = Jsoup.parse(html, url);
+
+        // 불필요 노드 제거
+        doc.select("script, style, noscript, header, footer, nav, aside, form, iframe").remove();
+
+        String title = "";
+        try {
+            title = Optional.ofNullable(doc.title()).orElse("");
+        } catch (Exception ignored) {}
+
+        // 1) article 우선
+        Element root = doc.selectFirst("article");
+        if (root == null) {
+            // 2) main
+            root = doc.selectFirst("main");
+        }
+        if (root == null) {
+            // 3) body fallback
+            root = doc.body();
+        }
+
+        if (root == null) return new ExtractHtmlResult(title, "");
+
+        Elements paras = root.select("p, li");
+        StringBuilder sb = new StringBuilder();
+        int taken = 0;
+
+        for (Element p : paras) {
+            String t = p.text();
+            if (t == null) continue;
+            t = t.trim();
+            if (t.isEmpty()) continue;
+
+            // 너무 짧은 텍스트는 노이즈일 가능성 ↑
+            if (t.length() < props.getUrl().getMinParagraphChars()) continue;
+
+            if (sb.length() + t.length() + 1 > maxChars) break;
+
+            sb.append(t).append('\n');
+            taken++;
+            if (taken >= maxParas) break;
+        }
+
+        String out = sb.toString().trim();
+        return new ExtractHtmlResult(title, out);
+    }
+
+    // -------------------------
+    // uploads (기존 동작 유지)
+    // -------------------------
+    private void ensureUploadDir() {
+        File dir = new File(UPLOAD_DIR_NAME);
+        if (!dir.exists()) dir.mkdirs();
+    }
+
+    private void cleanupExpiredUploads() {
+        File dir = new File(UPLOAD_DIR_NAME);
+        if (!dir.exists()) return;
+
+        long now = System.currentTimeMillis();
+        long ttlMs = props.getUpload().getTtlMs();
+
+        File[] files = dir.listFiles((d, n) -> n != null && n.startsWith(UPLOAD_PREFIX));
+        if (files == null) return;
+
+        for (File f : files) {
+            long age = now - f.lastModified();
+            if (age > ttlMs) {
+                try { f.delete(); } catch (Exception ignored) {}
             }
-        } catch (Exception ignore) {}
-        return null;
+        }
     }
 
-    private String guessName(String url) {
-        if (url == null || url.isBlank()) return "download.bin";
-        int q = url.indexOf('?');
-        String u = (q >= 0) ? url.substring(0, q) : url;
-        int i = u.lastIndexOf('/');
-        String tail = (i >= 0) ? u.substring(i + 1) : u;
-        if (tail.isBlank()) return "download.bin";
-        if (!tail.contains(".")) return tail + ".bin";
-        return tail;
-    }
-
-    private record URLDownload(String fileName, String contentType, byte[] bytes) {}
     private record SavedFile(String fileId, String storedFileName, String expiresAtUtc) {}
 
-    // -------------------------
-    // In-memory MultipartFile
-    // -------------------------
+    private SavedFile saveToUploads(String originalName, byte[] bytes) throws IOException {
+        String id = UUID.randomUUID().toString().replace("-", "");
+        String safe = sanitizeName(originalName);
+        String stored = UPLOAD_PREFIX + id + "_" + safe;
 
+        File dir = new File(UPLOAD_DIR_NAME);
+        File out = new File(dir, stored);
+
+        try (FileOutputStream fos = new FileOutputStream(out)) {
+            fos.write(bytes);
+        }
+
+        OffsetDateTime expires = OffsetDateTime.now(ZoneOffset.UTC).plusSeconds(props.getUpload().getTtlMs() / 1000);
+        return new SavedFile(id, stored, expires.toString());
+    }
+
+    // -------------------------
+    // in-memory MultipartFile
+    // -------------------------
     private static class InMemoryMultipartFile implements MultipartFile {
-        private final String originalName;
+        private final String fileName;
         private final String contentType;
         private final byte[] bytes;
 
-        InMemoryMultipartFile(String originalName, String contentType, byte[] bytes) {
-            this.originalName = originalName;
+        InMemoryMultipartFile(String fileName, String contentType, byte[] bytes) {
+            this.fileName = fileName;
             this.contentType = contentType;
-            this.bytes = (bytes == null) ? new byte[0] : bytes;
+            this.bytes = bytes;
         }
 
-        @Override public String getName() { return "file"; }
-        @Override public String getOriginalFilename() { return originalName; }
+        @Override public String getName() { return fileName; }
+        @Override public String getOriginalFilename() { return fileName; }
         @Override public String getContentType() { return contentType; }
-        @Override public boolean isEmpty() { return bytes.length == 0; }
-        @Override public long getSize() { return bytes.length; }
+        @Override public boolean isEmpty() { return bytes == null || bytes.length == 0; }
+        @Override public long getSize() { return bytes == null ? 0 : bytes.length; }
         @Override public byte[] getBytes() { return bytes; }
-        @Override public InputStream getInputStream() { return new ByteArrayInputStream(bytes); }
-
-        @Override
-        public void transferTo(java.io.File dest) throws java.io.IOException {
-            Files.write(dest.toPath(), bytes);
+        @Override public InputStream getInputStream() { return new ByteArrayInputStream(bytes == null ? new byte[0] : bytes); }
+        @Override public void transferTo(File dest) throws IOException {
+            try (FileOutputStream fos = new FileOutputStream(dest)) {
+                fos.write(getBytes());
+            }
         }
     }
 }

@@ -1,6 +1,7 @@
 package com.future.kakaomcp.application.doc;
 
 import com.future.kakaomcp.api.doc.dto.SummarizeResponse;
+import com.future.kakaomcp.application.doc.SummarizeMetadataContext.SourceType;
 import com.future.kakaomcp.application.doc.command.SummarizeCommand;
 import com.future.kakaomcp.domain.doc.TextExtractService;
 import com.future.kakaomcp.domain.doc.TextPreprocessor;
@@ -14,6 +15,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Service
 @RequiredArgsConstructor
@@ -88,7 +91,16 @@ public class DocFacade {
         String mode = (command == null || command.mode() == null || command.mode().isBlank())
                 ? "abstract" : command.mode().trim();
 
-        SummarizeMetadataContext ctx = buildSummarizeContext(normalized, enriched);
+        String filename = (file != null ? file.getOriginalFilename() : null);
+
+        SummarizeMetadataContext ctx = buildSummarizeContext(
+                SourceType.FILE,
+                null,
+                filename,
+                normalized,
+                enriched
+        );
+
         McpSummarizationService.Result sum = summarizationService.summarize(textForSummarize, mode, ctx);
 
         // ✅ includeMeta=false면 meta=null
@@ -101,13 +113,13 @@ public class DocFacade {
             meta.put("normalizedMetadata", normalized);
             meta.put("enrichedMetadata", enriched);
             meta.put("summarizeMeta", sum.meta());
-            meta.put("displayTitle", file != null ? file.getOriginalFilename() : null);
+            meta.put("displayTitle", filename);
         }
 
         return SummarizeResponse.builder()
                 .tool(McpToolName.SUMMARIZE_DOCUMENT)
                 .mode(mode)
-                .inputFileName(file != null ? file.getOriginalFilename() : null)
+                .inputFileName(filename)
                 .summaryText(sum.summaryText())
                 .meta(meta)
                 .build();
@@ -137,7 +149,14 @@ public class DocFacade {
         normalized.put("identifiers", orderedIdentifiers);
         normalized.put("identifierCandidates", Map.of("doi", doiCandidates, "isbn", isbnCandidates));
 
-        SummarizeMetadataContext ctx = buildSummarizeContext(normalized, enriched);
+        SummarizeMetadataContext ctx = buildSummarizeContext(
+                SourceType.TEXT,
+                null,
+                "(text)",
+                normalized,
+                enriched
+        );
+
         McpSummarizationService.Result sum = summarizationService.summarize(textForSummarize, mode, ctx);
 
         boolean includeMeta = (command == null) || command.includeMetaOrDefaultTrue();
@@ -159,57 +178,142 @@ public class DocFacade {
                 .build();
     }
 
-    private SummarizeMetadataContext buildSummarizeContext(Map<String, Object> normalized, Map<String, Object> enriched) {
+    /**
+     * normalized/enriched를 기반으로 SummarizeMetadataContext 구성
+     * - record는 immutable이라 “Set을 모아서 생성자에 주입”하는 방식으로 사용
+     */
+    private SummarizeMetadataContext buildSummarizeContext(
+            SourceType sourceType,
+            String sourceUrl,
+            String filename,
+            Map<String, Object> normalized,
+            Map<String, Object> enriched
+    ) {
         Set<String> dois = new LinkedHashSet<>();
         Set<String> isbns = new LinkedHashSet<>();
         Set<String> authors = new LinkedHashSet<>();
         Set<String> emails = new LinkedHashSet<>();
         Set<String> affiliations = new LinkedHashSet<>();
 
+        if (normalized == null) normalized = Map.of();
+        if (enriched == null) enriched = Map.of();
+
+        // ---- 1) DOI/ISBN 후보(normalized.identifierCandidates) ----
         Object candidatesObj = normalized.get("identifierCandidates");
         if (candidatesObj instanceof Map<?, ?> candMap) {
-            Object doiObj = candMap.get("doi");
-            if (doiObj instanceof Collection<?> c) for (Object x : c) if (x != null) dois.add(String.valueOf(x).trim());
-
-            Object isbnObj = candMap.get("isbn");
-            if (isbnObj instanceof Collection<?> c) for (Object x : c) if (x != null) isbns.add(String.valueOf(x).trim());
+            addAllStringish(dois, candMap.get("doi"));
+            addAllStringish(isbns, candMap.get("isbn"));
         }
 
+        // ---- 2) enrich merged (doi/isbn/authors/affiliations/emails) ----
         Object mergedObj = enriched.get("merged");
         if (mergedObj instanceof Map<?, ?> merged) {
-            Object doi = merged.get("doi");
-            if (doi != null) dois.add(String.valueOf(doi).trim());
-
-            Object isbn = merged.get("isbn");
-            if (isbn != null) isbns.add(String.valueOf(isbn).trim());
+            addStringish(dois, merged.get("doi"));
+            addStringish(isbns, merged.get("isbn"));
 
             Object auth = merged.get("authors");
-            if (auth instanceof String s && !s.isBlank()) {
-                for (String token : s.split("[,;]")) {
-                    String t = token.trim();
-                    if (!t.isEmpty()) authors.add(t);
-                }
-            } else if (auth instanceof Collection<?> c) {
-                for (Object x : c) {
-                    if (x == null) continue;
-                    String t = String.valueOf(x).trim();
-                    if (!t.isEmpty()) authors.add(t);
-                }
-            }
+            addPeopleLike(authors, auth);
+
+            Object aff = merged.get("affiliations");
+            addPeopleLike(affiliations, aff);
+
+            Object em = merged.get("emails");
+            addEmails(emails, em);
         }
 
-        Object authorObj = normalized.get("author");
-        if (authorObj instanceof String s && !s.isBlank()) {
-            for (String token : s.split("[,;]")) {
-                String t = token.trim();
-                if (!t.isEmpty()) authors.add(t);
-            }
+        // ---- 3) normalized 쪽 author/creator/publisher 등 ----
+        addPeopleLike(authors, normalized.get("author"));
+        addPeopleLike(authors, normalized.get("creator"));
+        addPeopleLike(authors, normalized.get("authors"));
+
+        // affiliation 후보 (publisher/organization 등)
+        addPeopleLike(affiliations, normalized.get("publisher"));
+        addPeopleLike(affiliations, normalized.get("organization"));
+        addPeopleLike(affiliations, normalized.get("affiliation"));
+
+        // 이메일 후보
+        addEmails(emails, normalized.get("email"));
+        addEmails(emails, normalized.get("emails"));
+
+        // ---- 4) 혹시 문자열 덩어리에서 이메일 패턴이 섞여 있으면 스캔 ----
+        scanEmailsFromStrings(emails, authors);
+        scanEmailsFromStrings(emails, affiliations);
+
+        return new SummarizeMetadataContext(
+                sourceType,
+                sourceUrl,
+                filename,
+                emails,
+                dois,
+                isbns,
+                authors,
+                affiliations
+        );
+    }
+
+    private void addStringish(Set<String> out, Object v) {
+        if (v == null) return;
+        String t = String.valueOf(v).trim();
+        if (!t.isEmpty()) out.add(t);
+    }
+
+    private void addAllStringish(Set<String> out, Object v) {
+        if (v == null) return;
+        if (v instanceof Collection<?> c) {
+            for (Object x : c) addStringish(out, x);
+        } else {
+            addStringish(out, v);
+        }
+    }
+
+    /**
+     * 사람이름/기관명 같이 "쉼표/세미콜론으로 나뉘는 값" 처리
+     */
+    private void addPeopleLike(Set<String> out, Object v) {
+        if (v == null) return;
+
+        if (v instanceof Collection<?> c) {
+            for (Object x : c) addPeopleLike(out, x);
+            return;
         }
 
-        Object publisherObj = normalized.get("publisher");
-        if (publisherObj instanceof String s && !s.isBlank()) affiliations.add(s.trim());
+        String s = String.valueOf(v).trim();
+        if (s.isEmpty()) return;
 
-        return new SummarizeMetadataContext(authors, emails, dois, isbns, affiliations);
+        // "a, b; c" 형태 지원
+        String[] tokens = s.split("[,;]");
+        for (String token : tokens) {
+            String t = token.trim();
+            if (!t.isEmpty()) out.add(t);
+        }
+    }
+
+    private static final Pattern EMAIL = Pattern.compile("[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}");
+
+    private void addEmails(Set<String> out, Object v) {
+        if (v == null) return;
+
+        if (v instanceof Collection<?> c) {
+            for (Object x : c) addEmails(out, x);
+            return;
+        }
+
+        String s = String.valueOf(v).trim();
+        if (s.isEmpty()) return;
+
+        Matcher m = EMAIL.matcher(s);
+        while (m.find()) {
+            out.add(m.group().trim());
+        }
+    }
+
+    private void scanEmailsFromStrings(Set<String> outEmails, Set<String> fromSet) {
+        if (fromSet == null || fromSet.isEmpty()) return;
+        for (String s : fromSet) {
+            if (s == null) continue;
+            Matcher m = EMAIL.matcher(s);
+            while (m.find()) outEmails.add(m.group().trim());
+        }
     }
 
     private Set<String> normalizeIdentifiersObject(Object identifiersFromMeta) {
@@ -220,6 +324,9 @@ public class DocFacade {
                 String t = String.valueOf(x).trim();
                 if (!t.isEmpty()) merged.add(t);
             }
+        } else if (identifiersFromMeta != null) {
+            String t = String.valueOf(identifiersFromMeta).trim();
+            if (!t.isEmpty()) merged.add(t);
         }
         return merged;
     }

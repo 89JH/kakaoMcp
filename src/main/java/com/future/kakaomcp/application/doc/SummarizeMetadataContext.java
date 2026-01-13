@@ -1,50 +1,101 @@
 package com.future.kakaomcp.application.doc;
 
-import java.util.*;
-import java.util.regex.Pattern;
+import java.util.Collections;
+import java.util.Set;
 
-/**
- * 요약 후처리(불릿 정제)를 위한 메타데이터 컨텍스트.
- * - author/email/doi/isbn/url/affiliation 등의 "잡음"을 필터링할 때 사용
- */
 public record SummarizeMetadataContext(
-        Set<String> authors,        // "Walter Sinnott-Armstrong" 같은 값들
-        Set<String> emails,         // "abc@domain.com"
-        Set<String> dois,           // "10.xxxx/...."
-        Set<String> isbns,          // "978..." (숫자/ X 포함)
-        Set<String> affiliations    // "University of Maryland" 등
+        SourceType sourceType,
+        String sourceUrl,
+        String filename,
+        Set<String> emails,
+        Set<String> dois,
+        Set<String> isbns,
+        Set<String> authors,
+        Set<String> affiliations
 ) {
+
+    public enum SourceType { TEXT, URL, FILE }
+
     public static SummarizeMetadataContext empty() {
-        return new SummarizeMetadataContext(Set.of(), Set.of(), Set.of(), Set.of(), Set.of());
+        return new SummarizeMetadataContext(
+                SourceType.TEXT,
+                null,
+                null,
+                Collections.emptySet(),
+                Collections.emptySet(),
+                Collections.emptySet(),
+                Collections.emptySet(),
+                Collections.emptySet()
+        );
     }
 
-    public SummarizeMetadataContext {
-        authors = (authors == null) ? Set.of() : normalizeSet(authors);
-        emails = (emails == null) ? Set.of() : normalizeSet(emails);
-        dois = (dois == null) ? Set.of() : normalizeSet(dois);
-        isbns = (isbns == null) ? Set.of() : normalizeSet(isbns);
-        affiliations = (affiliations == null) ? Set.of() : normalizeSet(affiliations);
+    public static SummarizeMetadataContext forText() {
+        return empty();
     }
 
-    private static Set<String> normalizeSet(Set<String> in) {
-        LinkedHashSet<String> out = new LinkedHashSet<>();
-        for (String s : in) {
-            if (s == null) continue;
-            String t = s.trim();
-            if (!t.isEmpty()) out.add(t);
+    public static SummarizeMetadataContext forUrl(String url) {
+        return new SummarizeMetadataContext(
+                SourceType.URL,
+                url,
+                null,
+                Collections.emptySet(),
+                Collections.emptySet(),
+                Collections.emptySet(),
+                Collections.emptySet(),
+                Collections.emptySet()
+        );
+    }
+
+    public static SummarizeMetadataContext forFile(String filename) {
+        return new SummarizeMetadataContext(
+                SourceType.FILE,
+                null,
+                filename,
+                Collections.emptySet(),
+                Collections.emptySet(),
+                Collections.emptySet(),
+                Collections.emptySet(),
+                Collections.emptySet()
+        );
+    }
+
+    // ----------------------------
+    // PromptTemplateBuilder 호환용
+    // ----------------------------
+    public String primaryDoi() {
+        return firstNonBlank(dois);
+    }
+
+    public String primaryIsbn() {
+        return firstNonBlank(isbns);
+    }
+
+    /**
+     * 현재 record에는 title 필드가 없으니 null 반환.
+     * (필요하면 나중에 title을 필드로 추가해도 됨)
+     */
+    public String title() {
+        return null;
+    }
+
+    /**
+     * “문서급 입력” 판정:
+     * - URL/FILE 이면 문서급으로 간주
+     * - TEXT라도 DOI/ISBN 있으면 문서급으로 간주
+     */
+    public boolean isDocument() {
+        if (sourceType == SourceType.URL || sourceType == SourceType.FILE) return true;
+        return primaryDoi() != null || primaryIsbn() != null;
+    }
+
+    private static String firstNonBlank(Set<String> set) {
+        if (set == null) return null;
+        for (String s : set) {
+            if (s != null) {
+                String t = s.trim();
+                if (!t.isBlank()) return t;
+            }
         }
-        return Collections.unmodifiableSet(out);
+        return null;
     }
-
-    // 기본 이메일 패턴 (후처리용)
-    public static final Pattern EMAIL_PATTERN =
-            Pattern.compile("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}");
-
-    // DOI로 보이는 패턴 (후처리용)
-    public static final Pattern DOI_PATTERN =
-            Pattern.compile("\\b10\\.\\d{4,9}/[^\\s\"'<>]+\\b", Pattern.CASE_INSENSITIVE);
-
-    // ISBN 후보(숫자/하이픈/공백 + X) (후처리용)
-    public static final Pattern ISBN_CANDIDATE =
-            Pattern.compile("\\b(?:97[89][\\-\\s]?)?(?:\\d[\\-\\s]?){9,12}[\\dXx]\\b");
 }
