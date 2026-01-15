@@ -12,7 +12,7 @@ public class JsonRpcDto {
     @Getter @Setter
     public static class Request {
         public String jsonrpc;  // "2.0"
-        public Object id;       // number|string|null
+        public Object id;       // number|string|null (notification에서는 없을 수 있음)
         public String method;
         public Map<String, Object> params;
     }

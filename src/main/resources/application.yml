@@ -58,6 +58,30 @@ app:
       num-ctx: 8192
       timeout-ms: 120000
 
+    # ✅ mode를 안 주는 호출(예: URL/FILE에서 mode 누락)일 때 자동 final 승격
+    auto-final:
+      enabled: true
+      threshold-chars: 12000
+
+    # ✅ 입력 길이에 따라 핵심 bullet 개수를 자동 증가
+    auto-bullets:
+      tier1-max-chars: 1200
+      tier2-max-chars: 2500
+      tier3-max-chars: 5000
+      tier4-max-chars: 9000
+
+      tier1: 3
+      tier2: 4
+      tier3: 6
+      tier4: 8
+      tier5: 10
+
+      # final이면 +2개 (최대 12로 clamp)
+      final-extra: 2
+
+      # chunk 단계에서는 너무 늘지 않게 캡
+      chunk-cap: 6
+
   # ✅ Prompt 관련 설정 (Spring placeholder 충돌 방지: {{}}만 사용)
   prompt:
     text-as-document-threshold: 1600
