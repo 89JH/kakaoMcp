@@ -1,53 +1,47 @@
-server:
-  port: 8080
-
-spring:
-  servlet:
-    multipart:
-      max-file-size: 50MB
-      max-request-size: 50MB
+# =========================
+# Spring 기본 서버 설정
+# =========================
+# 필요하면 포트 지정해서 쓰면 됨. (미지정 시 기본 8080)
+# server:
+#   port: 8080
 
 app:
+  server-name: kakao-mcp
+  server-version: 1.0.0
+
   temp-dir: ${java.io.tmpdir}/mcp-docs
   temp-ttl-minutes: 30
 
-  enrich:
-    enabled: true
-    crossref:
-      base-url: "https://api.crossref.org"
-      mailto: "chhh333@naver.com"
-      timeout-ms: 4000
-    google-books:
-      base-url: "https://www.googleapis.com/books/v1"
-      api-key: ""
-      timeout-ms: 4000
-
   mcp:
+    http:
+      timeout-ms: 4000
     sse:
+      timeout-ms: 4000
+    health:
       timeout-ms: 30000
-    download:
-      max-bytes: 26214400          # 25MB
-      connect-timeout-ms: 10000
-      read-timeout-ms: 60000
-      max-redirects: 8
-      user-agent: "Mozilla/5.0 (kakao-mcp)"
-    file:
-      max-bytes: 26214400          # 25MB
-    url:
-      max-url-chars: 35000
-      max-paras: 40
-      min-paragraph-chars: 40
-    upload:
-      ttl-ms: 21600000             # 6h
+
+  # ✅ McpToolProperties는 app.sse.* 를 사용 (Streamable HTTP(SSE) 응답 유지)
+  sse:
+    timeout-ms: 4000
+
+  download:
+    connect-timeout-ms: 10000
+    # URL fetch + 본문 정리 + LLM 요약까지 고려해서 넉넉하게
+    read-timeout-ms: 600000
+    max-bytes: 10485760
+    user-agent: "Mozilla/5.0 (kakao-mcp)"
+
+  # ✅ URL 본문 텍스트 추출 상한/문단 정책 (DocFacade.fetchUrlAsText에서 사용)
+  # - 위키 같은 긴 페이지도 빠르게 abstract를 받기 위해 상한을 낮게 유지
+  # - final은 DocFacade에서 mode별 상한(abstract 12k / final 18k)으로 한 번 더 캡
+  url:
+    max-url-chars: 18000
+    max-paras: 80
+    min-paragraph-chars: 40
 
   summarize:
-    engine: ollama
-    final:
-      max-chars: 6000
-    chunk:
-      summary-max-chars: 1800
-      target-chars: 3000
-      overlap-chars: 250
+    url:
+      max-chars: 80000
       min-chars: 900
       max-chunks: 18
     ollama:
@@ -56,7 +50,7 @@ app:
       temperature: 0.2
       top-p: 0.9
       num-ctx: 8192
-      timeout-ms: 120000
+      timeout-ms: 600000
 
     # ✅ mode를 안 주는 호출(예: URL/FILE에서 mode 누락)일 때 자동 final 승격
     auto-final:
@@ -67,64 +61,75 @@ app:
     auto-bullets:
       tier1-max-chars: 1200
       tier2-max-chars: 2500
-      tier3-max-chars: 5000
-      tier4-max-chars: 9000
-
-      tier1: 3
-      tier2: 4
-      tier3: 6
-      tier4: 8
-      tier5: 10
-
-      # final이면 +2개 (최대 12로 clamp)
+      tier3-max-chars: 4500
+      tier4-max-chars: 8000
+      tier5-max-chars: 14000
+      # ✅ 5~20개 범위 (길수록 증가)
+      tier1: 5
+      tier2: 6
+      tier3: 8
+      tier4: 12
+      tier5: 18
+      # final이면 조금 더 많게 (최대 20)
       final-extra: 2
+      # chunk 요약은 너무 길어지지 않게
+      chunk-cap: 10
 
-      # chunk 단계에서는 너무 늘지 않게 캡
-      chunk-cap: 6
-
-  # ✅ Prompt 관련 설정 (Spring placeholder 충돌 방지: {{}}만 사용)
   prompt:
-    text-as-document-threshold: 1600
-
-    # ✅ 불릿 나열 금지 (모델이 그대로 출력하는 경향이 큼)
     common-rules: >
       출력에는 "요약 결과"만 작성한다.
+      반드시 한국어(한글)로만 출력한다. 한자(漢字)/중국어/일본어 문자는 한 글자도 출력하지 않는다.
       프롬프트/지시문/마커/참고/입력길이/규칙/포맷 설명 문구는 절대 출력하지 않는다.
       근거는 본문 내용만 사용하고, 모르는 내용은 "알 수 없음"으로 쓴다.
       중복 없이 간결하게 쓴다.
 
     template:
-      abstract: |
-        [[KAKAO_MCP_PREFIX_V2]]
-        {{COMMON_RULES}}
+      abstract-template: |
+        [[KAKAO_MCP_PROMPT_V2]]
+        {{SOURCE_HINT}}
+        아래 본문을 요약하라.
 
-        [출력형식]
-        - 한줄요약: (1문장)
-        - 핵심: (3~7개 불릿)
-
-        [본문]
-        {{BODY}}
-
-      final: |
-        [[KAKAO_MCP_PREFIX_V2]]
-        {{COMMON_RULES}}
-
-        [출력형식]
-        - 한줄요약: (1문장)
-        - 핵심: (5~10개 불릿)
-        - 제안: (3개 불릿)
+        - 한 줄 요약: 1줄
+        - 핵심(정확히 {{POINTS}}개):
+          - (총 {{POINTS}}개가 되도록. 더 늘리거나 줄이면 안 됨)
 
         [본문]
-        {{BODY}}
+        {{TEXT}}
 
-# Spring이 Node MCP를 띄우는 설정(환경에 맞게 경로만 유지/수정)
+      final-template: |
+        [[KAKAO_MCP_PROMPT_V2]]
+        {{SOURCE_HINT}}
+        아래 본문을 자세히 요약하라.
+
+        - 한 줄 요약: 1줄
+        - 핵심(정확히 {{POINTS}}개):
+          - (총 {{POINTS}}개가 되도록. 더 늘리거나 줄이면 안 됨)
+
+        [본문]
+        {{TEXT}}
+
+# =========================
+# ✅ 해결책 B: Spring이 Node MCP를 stdio로 직접 실행하도록 설정
+# (현재 에러: mcp.args 비어있음 -> 여기 추가하면 부팅 성공)
+# =========================
 mcp:
+  # Node MCP/LLM 처리가 길어질 수 있어 타임아웃을 넉넉하게
+  request-timeout-seconds: 600
+
+  # ✅ node 실행 커맨드
   command: node
+
+  # ✅ nodeMcp 폴더 경로 (네 서버 기준 /opt/kakaoMcp/nodeMcp)
+  #    만약 다른 위치면 여기만 바꾸면 됨
+  workdir: /opt/kakaoMcp/nodeMcp
+
+  # ✅ mcp.args 필수 (비어있으면 IllegalStateException으로 부팅 실패)
   args:
     - index.js
-  workdir: /opt/kakaoMcp/nodeMcp
+
+  # ✅ node 프로세스 환경변수 (필요하면 추가)
   env:
-    OLLAMA_BASE: http://127.0.0.1:11434
-    OLLAMA_MODEL: qwen2.5:7b
-    OLLAMA_MAX_CHARS: "6000"
-  request-timeout-seconds: 60
+    OLLAMA_TIMEOUT_MS: "600000"
+    OLLAMA_BASE: "http://127.0.0.1:11434"
+    OLLAMA_MODEL: "qwen2.5:7b"
+    MCP_FORBID_EXTRA_SECTIONS: "true"
