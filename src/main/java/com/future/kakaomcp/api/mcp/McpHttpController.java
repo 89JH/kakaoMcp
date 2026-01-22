@@ -10,6 +10,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -28,13 +29,14 @@ import static com.future.kakaomcp.api.mcp.JsonRpcDto.*;
 public class McpHttpController {
 
     private static final ObjectMapper OM = new ObjectMapper();
+
     private static final String JSONRPC = "2.0";
 
     private static final String PROTOCOL_LATEST = "2025-03-26";
     private static final Set<String> SUPPORTED_PROTOCOLS = Set.of(
             "2025-03-26"
             // 필요 없으면 2024-11-05는 빼도 됨
-            // ,"2024-11-05"
+            //,"2024-11-05"
     );
 
     private static final String TOOL_SUMMARIZE_TEXT = "summarize_text";
@@ -72,7 +74,13 @@ public class McpHttpController {
         Map<String, Object> params = asMap(req.get("params"));
 
         if (wantSse) {
-            // Streamable HTTP: single message event
+            // Streamable HTTP:
+            // - tools/call: real SSE stream (progress + final result)
+            // - others: keep single message event for compatibility
+            if ("tools/call".equals(method)) {
+                return handleToolsCallSse(id, params);
+            }
+
             String eventId = "id:" + Instant.now().toEpochMilli();
             Map<String, Object> out = dispatch(method, id, params);
 
@@ -81,6 +89,7 @@ public class McpHttpController {
                     .contentType(MediaType.TEXT_EVENT_STREAM)
                     .body(ssePayload);
         }
+
 
         Map<String, Object> out = dispatch(method, id, params);
         return ResponseEntity.ok()
@@ -224,27 +233,124 @@ public class McpHttpController {
 
         if (name == null) return error(id, -32602, "Invalid params", Map.of("message", "params.name is required"));
 
+        long start = System.currentTimeMillis();
+        Map<String, Object> base;
+
         switch (name) {
             case TOOL_SUMMARIZE_TEXT:
             case TOOL_SUMMARIZE_DOCUMENT:
-                return callSummarizeText(id, args);
+                base = callSummarizeText(id, args);
+                break;
 
             case TOOL_SUMMARIZE_URL:
                 // ✅ FIX: checked exception(throws Exception) 처리
                 try {
-                    return callSummarizeUrl(id, args);
+                    base = callSummarizeUrl(id, args);
                 } catch (Exception e) {
-                    log.error("summarize_url failed", e);
-                    return error(id, -32603, "Internal error", Map.of("message", e.getMessage()));
+                    return error(
+                            id,
+                            -32000,
+                            "summarize_url failed",
+                            Map.of("exception", e.getMessage())
+                    );
                 }
+                break;
 
             case TOOL_SUMMARIZE_FILE:
-                return callSummarizeFile(id, args);
+                base = callSummarizeFile(id, args);
+                break;
 
             default:
                 return error(id, -32601, "Tool not found", Map.of("name", name));
         }
+
+        // On success, attach structuredContent(B안: meta only) without changing the human-facing text.
+        if (base != null && base.containsKey("result")) {
+            long durationMs = System.currentTimeMillis() - start;
+            Map<String, Object> structured = buildStructuredMeta(name, args, durationMs);
+            addStructuredContent(base, structured);
+        }
+
+        return base;
     }
+
+    /**
+     * SSE tools/call: emits progress events and finally a result event containing the normal JSON-RPC response.
+     * - content text remains unchanged
+     * - structuredContent(meta) is attached in the final result
+     */
+    private ResponseEntity<SseEmitter> handleToolsCallSse(Object id, Map<String, Object> params) {
+        SseEmitter emitter = new SseEmitter(0L);
+
+        new Thread(() -> {
+            try {
+                sendProgress(emitter, "start", "요청 수신", 0);
+
+                sendProgress(emitter, "dispatch", "도구 실행 중", 20);
+
+                Map<String, Object> out = handleToolsCall(id, params);
+
+                sendProgress(emitter, "done", "완료", 100);
+
+                emitter.send(SseEmitter.event()
+                        .name("result")
+                        .data(out));
+
+                emitter.complete();
+            } catch (Exception e) {
+                log.error("SSE tools/call error", e);
+                try {
+                    emitter.send(SseEmitter.event()
+                            .name("error")
+                            .data(error(id, -32603, "Internal error", Map.of("message", e.getMessage()))));
+                } catch (Exception ignore) {
+                }
+                emitter.completeWithError(e);
+            }
+        }).start();
+
+        return ResponseEntity.ok()
+                .contentType(MediaType.TEXT_EVENT_STREAM)
+                .body(emitter);
+    }
+
+    private void sendProgress(SseEmitter emitter, String stage, String message, int percent) throws IOException {
+        emitter.send(SseEmitter.event()
+                .name("progress")
+                .data(Map.of(
+                        "stage", stage,
+                        "message", message,
+                        "percent", percent
+                )));
+    }
+
+    private Map<String, Object> buildStructuredMeta(String toolName, Map<String, Object> args, long durationMs) {
+        Map<String, Object> meta = new LinkedHashMap<>();
+        meta.put("tool", toolName);
+        meta.put("mode", args == null ? null : args.getOrDefault("mode", "abstract"));
+        meta.put("metrics", Map.of(
+                "durationMs", durationMs,
+                "generatedAt", Instant.now().toString()
+        ));
+        meta.put("source", Map.of(
+                "type", toolName,
+                "arguments", args == null ? Map.of() : args
+        ));
+        return meta;
+    }
+
+    @SuppressWarnings("unchecked")
+    private void addStructuredContent(Map<String, Object> okResponse, Map<String, Object> structuredContent) {
+        // okResponse = {"jsonrpc":..., "id":..., "result": {...}}
+        Object r = okResponse.get("result");
+        if (!(r instanceof Map<?, ?>)) return;
+
+        Map<String, Object> resultMap = new LinkedHashMap<>((Map<String, Object>) r);
+        resultMap.put("structuredContent", structuredContent);
+        okResponse.put("result", resultMap);
+    }
+
+
 
     private Map<String, Object> callSummarizeText(Object id, Map<String, Object> args) {
         String text = asString(args.get("text"));
@@ -389,20 +495,16 @@ public class McpHttpController {
         return Base64.getDecoder().decode(s);
     }
 
-    /**
-     * ✅ MCP content로 내려줄 "문자열"만 추출
-     * - SummarizeResponse -> summaryText
-     * - Map -> summaryText 또는 content[0].text
-     * - String -> 그대로
-     */
     private static String extractText(Object result) {
         if (result == null) return "";
-        if (result instanceof String s) return s;
 
+        // 1) SummarizeResponse면 summaryText 우선
         if (result instanceof SummarizeResponse sr) {
             return sr.getSummaryText() == null ? "" : sr.getSummaryText();
         }
 
+
+        // 2) Map 형태로 들어오면 summaryText / content[0].text 우선
         if (result instanceof Map<?, ?> m) {
             Object summaryText = m.get("summaryText");
             if (summaryText instanceof String s) return s;
@@ -418,7 +520,16 @@ public class McpHttpController {
             }
         }
 
-        return String.valueOf(result);
+        // 3) 그냥 String이면 그대로
+        if (result instanceof String s) return s;
+
+        // 4) 마지막 fallback: JSON으로 찍기 (toString() 방지)
+        try {
+            // 이 메소드가 static이라 ObjectMapper가 없으니 최소 fallback만
+            return String.valueOf(result);
+        } catch (Exception ignore) {
+            return "";
+        }
     }
 
     // URL download helpers
@@ -433,6 +544,9 @@ public class McpHttpController {
         conn.setReadTimeout(toolProperties.getDownload().getReadTimeoutMs());
 
         conn.setRequestProperty("User-Agent", toolProperties.getDownload().getUserAgent());
+
+        // ✅ 일부 사이트는 gzip/브로틀리 등 압축 응답을 주는데,
+        //    여기서는 단순 처리를 위해 identity로 고정 (필요 시 gzip 처리 추가 가능)
         conn.setRequestProperty("Accept-Encoding", "identity");
 
         int code = conn.getResponseCode();
@@ -449,7 +563,9 @@ public class McpHttpController {
             bytes = readAllLimited(in, toolProperties.getDownload().getMaxBytes());
         }
 
+        // contentType은 지금은 쓰지 않지만, 추후 분기용으로 남겨둠
         log.debug("download ok: url={}, type={}, bytes={}", url, contentType, bytes.length);
+
         return new URLDownload(bytes, filename);
     }
 
@@ -470,6 +586,7 @@ public class McpHttpController {
     }
 
     private static String guessFilename(String url, String contentDisposition) {
+        // Content-Disposition: attachment; filename="..."
         String lower = contentDisposition.toLowerCase(Locale.ROOT);
         int idx = lower.indexOf("filename=");
         if (idx >= 0) {
